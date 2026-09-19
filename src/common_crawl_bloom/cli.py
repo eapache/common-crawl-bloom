@@ -17,32 +17,37 @@ def positive_int(value):
 
 
 def add_size_options(parser):
-    parser.add_argument("--expected-urls", type=positive_int, required=True,
-                        help="estimated distinct eligible URLs across all selected crawls")
+    parser.add_argument("--expected-urls", type=positive_int,
+                        help="override automatic sizing with an estimated distinct URL count")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--false-positive-rate", type=float, default=1e-6)
     group.add_argument("--size-mib", type=positive_int, help="fixed filter allocation in MiB")
+
+
+def add_source_options(parser, required=False):
+    selection = parser.add_mutually_exclusive_group(required=required)
+    selection.add_argument("--crawl", action="append", help="CC-MAIN-YYYY-WW; repeat for a union")
+    selection.add_argument("--latest", type=positive_int, help="use the latest N crawl snapshots")
+    parser.add_argument("--max-shards", type=positive_int,
+                        help="process only the first N shards total (partial coverage)")
+    parser.add_argument("--max-range-mib", type=positive_int, default=64,
+                        help="maximum single compressed-column/footer read in MiB")
+    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--retries", type=int, default=3)
 
 
 def parser():
     root = argparse.ArgumentParser(description="Build exact-URL Bloom filters from Common Crawl")
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("crawls", help="list available crawl IDs")
-    plan = commands.add_parser("plan", help="calculate filter RAM and precision without downloading")
+    plan = commands.add_parser("plan", help="preview filter RAM and precision; auto sizing reads metadata")
     add_size_options(plan)
+    add_source_options(plan)
     build = commands.add_parser("build", help="download and process a union of crawl snapshots")
-    selection = build.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--crawl", action="append", help="CC-MAIN-YYYY-WW; repeat for a union")
-    selection.add_argument("--latest", type=positive_int, help="use the latest N crawl snapshots")
+    add_source_options(build, required=True)
     add_size_options(build)
     build.add_argument("--output", type=Path, required=True)
-    build.add_argument("--max-range-mib", type=positive_int, default=64,
-                       help="maximum single compressed-column/footer read in MiB")
     build.add_argument("--batch-size", type=positive_int, default=65536)
-    build.add_argument("--max-shards", type=positive_int,
-                       help="process only the first N shards total (partial coverage)")
-    build.add_argument("--timeout", type=float, default=60)
-    build.add_argument("--retries", type=int, default=3)
     build.add_argument("--allow-overfilled", action="store_true",
                        help="publish even if occupancy-estimated FPR exceeds design by >10%%")
     inspect = commands.add_parser("inspect", help="verify checksum and print artifact metadata")
@@ -71,13 +76,16 @@ def run(args):
             all_present &= present
         return 0 if all_present else 1
     size_bytes = args.size_mib * 1024 * 1024 if args.size_mib else None
-    dimensions = sizing(args.expected_urls, args.false_positive_rate, size_bytes)
-    if args.command == "plan":
-        print(json.dumps(dimensions, indent=2))
+    # Validate sizing flags before making network requests.
+    sizing(args.expected_urls or 1, args.false_positive_rate, size_bytes)
+    if args.command == "plan" and not (args.latest or args.crawl):
+        if args.expected_urls is None:
+            raise ValueError("plan requires --latest, --crawl, or --expected-urls")
+        print(json.dumps(sizing(args.expected_urls, args.false_positive_rate, size_bytes), indent=2))
         return 0
-    if args.output.exists():
+    if args.command == "build" and args.output.exists():
         raise ValueError(f"output already exists: {args.output}")
-    if not args.output.parent.is_dir():
+    if args.command == "build" and not args.output.parent.is_dir():
         raise ValueError(f"output directory does not exist: {args.output.parent}")
     downloader = Downloader(args.timeout, args.retries)
     if args.latest:
@@ -91,15 +99,28 @@ def run(args):
     total_shards = len(urls)
     if args.max_shards:
         urls = urls[:args.max_shards]
-    print(json.dumps({"crawls": crawls, "selected_shards": len(urls),
+    progress = lambda record: print(json.dumps(record), file=sys.stderr, flush=True)
+    expected_urls = args.expected_urls
+    sizing_source = {"method": "explicit", "expected_urls": expected_urls}
+    if expected_urls is None:
+        from .build import count_rows
+        sizing_source = count_rows(urls, downloader, args.max_range_mib * 1024 * 1024,
+                                   progress=progress)
+        expected_urls = sizing_source["rows"]
+    dimensions = sizing(expected_urls, args.false_positive_rate, size_bytes)
+    summary = {"crawls": crawls, "selected_shards": len(urls),
                       "available_shards": total_shards, "filter": dimensions,
-                      "max_range_bytes": args.max_range_mib * 1024 * 1024}),
-          file=sys.stderr, flush=True)
-    bloom = BloomFilter(args.expected_urls, args.false_positive_rate, size_bytes)
+                      "sizing": sizing_source,
+                      "max_range_bytes": args.max_range_mib * 1024 * 1024}
+    if args.command == "plan":
+        print(json.dumps(summary, indent=2))
+        return 0
+    progress(summary)
+    bloom = BloomFilter(expected_urls, args.false_positive_rate, size_bytes)
     from .build import build
     stats = build(urls, bloom, downloader, args.max_range_mib * 1024 * 1024,
                   args.batch_size,
-                  progress=lambda record: print(json.dumps(record), file=sys.stderr, flush=True))
+                  progress=progress)
     if bloom.stats()["estimated_fpr"] > dimensions["design_fpr"] * 1.1:
         if not args.allow_overfilled:
             raise ValueError("filter overfilled: estimated FPR exceeds design by >10%; "
@@ -110,7 +131,7 @@ def run(args):
                 "shard_list_sha256": hashlib.sha256("\n".join(urls).encode()).hexdigest(),
                 "available_shards": total_shards,
                 "partial": len(urls) < total_shards, "status_policy": "200 <= fetch_status < 300",
-                "build": stats}
+                "sizing": sizing_source, "build": stats}
     bloom.save(args.output, metadata)
     print(json.dumps({"output": str(args.output), **bloom.stats()}))
     return 0

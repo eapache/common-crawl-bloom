@@ -19,6 +19,25 @@ class BuildStats:
     rejected_urls: int = 0
 
 
+def count_rows(urls, downloader, max_range_bytes=64 * 1024 * 1024, progress=None):
+    """Read shard metadata for a conservative bound on distinct eligible URLs."""
+    rows = downloaded_bytes = 0
+    for count, url in enumerate(urls, 1):
+        with HTTPRangeReader(url, downloader, max_range_bytes) as reader:
+            with pq.ParquetFile(reader, pre_buffer=False, buffer_size=0) as parquet:
+                if not {"url", "fetch_status"} <= set(parquet.schema_arrow.names):
+                    raise ValueError("Parquet shard lacks url or fetch_status columns")
+                rows += parquet.metadata.num_rows
+            downloaded_bytes += reader.downloaded_bytes
+        if progress:
+            progress({"phase": "sizing", "shards": count, "rows": rows,
+                      "downloaded_bytes": downloaded_bytes, "last_shard": url})
+    if not rows:
+        raise ValueError("no rows found in selected shards")
+    return {"method": "parquet_row_upper_bound", "rows": rows,
+            "downloaded_bytes": downloaded_bytes}
+
+
 def build(urls, bloom, downloader, max_range_bytes: int = 64 * 1024 * 1024,
           batch_size: int = 65536, progress=None) -> dict:
     """Project columns over HTTPS ranges; prefetch one decoded batch in RAM."""

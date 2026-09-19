@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from common_crawl_bloom import BloomFilter
-from common_crawl_bloom.build import build
+from common_crawl_bloom.build import build, count_rows
 from common_crawl_bloom.cli import main
 from common_crawl_bloom.source import (DATA_URL, DownloadError, Downloader,
                                       collections, consume_generated, shard_urls)
@@ -189,3 +189,70 @@ def test_partial_metadata_and_overfill_guard(tmp_path):
     assert loaded.metadata["partial"] is True
     assert loaded.metadata["processed_shards"] == 1
     assert loaded.stats()["estimated_fpr"] > loaded.stats()["design_fpr"]
+
+
+@pytest.mark.parametrize("size_options", [[], ["--size-mib", "1"]])
+def test_cli_automatic_sizing_union_and_plan(tmp_path, capsys, size_options):
+    output = tmp_path / "auto.bloom"
+    url = "https://example.org/"
+    downloader = FakeDownloader({
+        "a": parquet_bytes([url] * 50, [200] * 50),
+        "b": parquet_bytes([url] * 50, [200] * 25 + [404] * 25)})
+    selection = ["--latest", "2", "--max-shards", "2"] + size_options
+    with patch("common_crawl_bloom.cli.Downloader", return_value=downloader), \
+            patch("common_crawl_bloom.cli.collections", return_value=[
+                {"id": "CC-MAIN-2025-33"}, {"id": "CC-MAIN-2025-30"}]), \
+            patch("common_crawl_bloom.cli.shard_urls", side_effect=[
+                ["a"], ["b", "unselected"], ["a"], ["b", "unselected"]]):
+        with patch("sys.argv", ["cc-bloom", "plan"] + selection), \
+                patch("common_crawl_bloom.cli.BloomFilter") as allocation:
+            assert main() == 0
+            allocation.assert_not_called()
+        plan = json.loads(capsys.readouterr().out)
+        with patch("sys.argv", ["cc-bloom", "build"] + selection + ["--output", str(output)]):
+            assert main() == 0
+    loaded = BloomFilter.load(output)
+    assert loaded.parameters == plan["filter"]
+    assert loaded.parameters["expected_urls"] == 100
+    if size_options:
+        assert loaded.parameters["size_bytes"] == 1024 * 1024
+    assert url in loaded
+    assert loaded.metadata["partial"] is True
+    assert loaded.metadata["sizing"]["method"] == "parquet_row_upper_bound"
+    assert loaded.metadata["build"]["accepted_urls"] == 75
+    assert all(buffer.closed for buffer in downloader.buffers)
+
+
+def test_count_rows_reads_metadata_only():
+    downloader = FakeDownloader({"a": parquet_bytes(["https://example.org/"] * 4, [200] * 4)})
+    reports = []
+    with patch.object(pq.ParquetFile, "iter_batches", side_effect=AssertionError("decoded rows")):
+        result = count_rows(["a"], downloader, 10000, progress=reports.append)
+    assert result["rows"] == 4
+    assert result["downloaded_bytes"] > 0
+    assert reports[0]["phase"] == "sizing"
+    with pytest.raises(ValueError, match="no rows"):
+        count_rows([], downloader)
+
+
+def test_cli_offline_plan_and_missing_selection(capsys):
+    with patch("common_crawl_bloom.cli.Downloader") as downloader:
+        with patch("sys.argv", ["cc-bloom", "plan", "--expected-urls", "100"]):
+            assert main() == 0
+        assert json.loads(capsys.readouterr().out)["expected_urls"] == 100
+        with patch("sys.argv", ["cc-bloom", "plan"]):
+            assert main() == 2
+        assert "plan requires" in capsys.readouterr().err
+        downloader.assert_not_called()
+
+
+def test_failed_automatic_sizing_never_allocates_or_publishes(tmp_path):
+    output = tmp_path / "bad.bloom"
+    with patch("sys.argv", ["cc-bloom", "build", "--latest", "1", "--output", str(output)]), \
+            patch("common_crawl_bloom.cli.Downloader", return_value=FakeDownloader({"a": b"bad"})), \
+            patch("common_crawl_bloom.cli.collections", return_value=[{"id": "CC-MAIN-2025-33"}]), \
+            patch("common_crawl_bloom.cli.shard_urls", return_value=["a"]), \
+            patch("common_crawl_bloom.cli.BloomFilter") as allocation:
+        assert main() == 2
+        allocation.assert_not_called()
+    assert not output.exists()

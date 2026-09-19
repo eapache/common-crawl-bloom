@@ -21,22 +21,22 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[test]'
 .venv/bin/cc-bloom crawls
 
-# Estimate filter size without downloading or allocating it.
-.venv/bin/cc-bloom plan --expected-urls 1000000000 --false-positive-rate 1e-6
+# Preview filter size by reading metadata, without allocating the filter.
+.venv/bin/cc-bloom plan --latest 1 --false-positive-rate 1e-6
 
 # Try one shard from the latest crawl before committing to a full build.
 .venv/bin/cc-bloom build --latest 1 --max-shards 1 \
-  --expected-urls 20000000 --output sample.bloom
+  --output sample.bloom
 
 # Combine two snapshots into one filter.
 .venv/bin/cc-bloom build \
   --crawl CC-MAIN-2025-33 --crawl CC-MAIN-2025-30 \
-  --expected-urls 3000000000 --false-positive-rate 1e-6 \
+  --false-positive-rate 1e-6 \
   --output urls.bloom
 ```
 
-URL counts above are sizing examples, not measured crawl counts. Size for the
-**distinct URLs across all selected crawls**; duplicates do not increase occupancy.
+Builds automatically size the filter from the selected shards' Parquet row counts.
+You do not need to estimate URL counts or overlap between crawls.
 Use `--latest 3` for the newest three snapshots, or repeat `--crawl` for reproducible
 selection. Crawl IDs use `CC-MAIN-YYYY-WW`, not calendar month numbers.
 
@@ -47,7 +47,23 @@ build. More snapshots increase historical coverage, build time, and capacity nee
 ## Size and memory
 
 Set `--false-positive-rate` (default `1e-6`), or replace it with `--size-mib` for a
-fixed bit-array budget. Both require `--expected-urls` to choose the hash count.
+fixed bit-array budget. By default, a metadata pass sums the rows in the selected
+shards before choosing the filter size and hash count. This is a conservative
+upper bound on distinct eligible URLs: duplicate URLs, overlapping crawls, and
+unsuccessful responses can leave unused capacity. The metadata pass does not
+decode URL columns, but requires requests for every selected shard. Its download
+cost is reported separately in the artifact's `sizing` metadata.
+
+Use `plan --latest N` (or `plan --crawl ...`) with the same selection and sizing
+options as your build to preview memory needs. `--max-shards` also limits the
+sizing pass. With `--size-mib`, the allocation stays fixed and the program chooses
+the hash count from the row bound; inspect the reported `design_fpr` for precision.
+
+If you already have a distinct URL estimate, `--expected-urls N` overrides automatic
+sizing and skips the metadata pass. Overlap does not increase filter occupancy.
+`plan --expected-urls N` still works offline. Measuring the distinct union instead
+of using a row bound would require an additional pass through the URL data.
+
 For **1 billion distinct URLs**, approximate filter RAM is:
 
 | False-positive probability | Bit-array RAM |

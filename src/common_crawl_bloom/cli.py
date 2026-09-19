@@ -24,6 +24,14 @@ def add_size_options(parser):
     group.add_argument("--size-mib", type=positive_int, help="fixed filter allocation in MiB")
 
 
+def add_download_options(parser):
+    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--retries", type=int, default=10,
+                        help="retries per request after transient failures (default: 10)")
+    parser.add_argument("--request-interval", type=float, default=1,
+                        help="minimum seconds between request starts (default: 1; 0 disables pacing)")
+
+
 def add_source_options(parser, required=False):
     selection = parser.add_mutually_exclusive_group(required=required)
     selection.add_argument("--crawl", action="append", help="CC-MAIN-YYYY-WW; repeat for a union")
@@ -32,14 +40,13 @@ def add_source_options(parser, required=False):
                         help="process only the first N shards total (partial coverage)")
     parser.add_argument("--max-range-mib", type=positive_int, default=64,
                         help="maximum single compressed-column/footer read in MiB")
-    parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--retries", type=int, default=3)
+    add_download_options(parser)
 
 
 def parser():
     root = argparse.ArgumentParser(description="Build exact-URL Bloom filters from Common Crawl")
     commands = root.add_subparsers(dest="command", required=True)
-    commands.add_parser("crawls", help="list available crawl IDs")
+    add_download_options(commands.add_parser("crawls", help="list available crawl IDs"))
     plan = commands.add_parser("plan", help="preview filter RAM and precision; auto sizing reads metadata")
     add_size_options(plan)
     add_source_options(plan)
@@ -60,7 +67,7 @@ def parser():
 
 def run(args):
     if args.command == "crawls":
-        for crawl in collections(Downloader()):
+        for crawl in collections(Downloader(args.timeout, args.retries, args.request_interval)):
             print(f"{crawl['id']}\t{crawl.get('name', '')}")
         return 0
     if args.command in ("inspect", "check"):
@@ -87,7 +94,7 @@ def run(args):
         raise ValueError(f"output already exists: {args.output}")
     if args.command == "build" and not args.output.parent.is_dir():
         raise ValueError(f"output directory does not exist: {args.output.parent}")
-    downloader = Downloader(args.timeout, args.retries)
+    downloader = Downloader(args.timeout, args.retries, args.request_interval)
     if args.latest:
         available = collections(downloader)
         if len(available) < args.latest:

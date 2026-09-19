@@ -110,6 +110,18 @@ parameters before checking.
 
 ## Operational notes
 
+- `crawls`, `plan`, and `build` accept `--request-interval SECONDS` (default `1`)
+  to pace request starts, including HEAD requests and retries. Pacing is shared
+  within one downloader, not across separate processes; `0` disables it.
+- `--retries N` defaults to `10` retries per request. Transient failures use
+  exponential backoff with jitter, starting at 1–1.25 seconds and capped at
+  60 seconds. A valid `Retry-After` delay or HTTP date is honored even when it
+  exceeds that cap. `--timeout` defaults to 60 seconds per socket operation,
+  not a total deadline for all retries.
+- For example, slow a build further with
+  `cc-bloom build --latest 1 --request-interval 2 --retries 20 --output urls.bloom`.
+  These defaults are conservative client settings, not a published Common Crawl
+  quota; see their [download guidance](https://status.commoncrawl.org/).
 - Progress is JSON on stderr after each shard; completion is JSON on stdout.
 - Downloads retry transient failures. Failed builds do not publish a completed
   filter, and existing output files are never replaced.

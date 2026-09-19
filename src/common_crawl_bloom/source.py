@@ -1,11 +1,15 @@
 """Common Crawl manifests and bounded in-memory HTTP downloads."""
 
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 import gzip
 import http.client
 import io
 import json
+import math
+import random
 import re
+from threading import Lock
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -20,11 +24,49 @@ class DownloadError(RuntimeError):
 
 
 class Downloader:
-    def __init__(self, timeout: float = 60, retries: int = 3):
-        if timeout <= 0 or retries < 0:
-            raise ValueError("timeout must be positive and retries nonnegative")
+    def __init__(self, timeout: float = 60, retries: int = 10, request_interval: float = 1):
+        if not math.isfinite(timeout) or timeout <= 0 or retries < 0:
+            raise ValueError("timeout must be finite and positive and retries nonnegative")
+        if not math.isfinite(request_interval) or request_interval < 0:
+            raise ValueError("request interval must be finite and nonnegative")
         self.timeout = timeout
         self.retries = retries
+        self.request_interval = request_interval
+        self._last_request = None
+        self._pacing_lock = Lock()
+
+    def _pace(self):
+        # Share pacing across GETs, HEADs, and retries on this downloader.
+        with self._pacing_lock:
+            if self._last_request is not None:
+                delay = self._last_request + self.request_interval - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            self._last_request = time.monotonic()
+
+    def _retry(self, exc, attempt, message):
+        retry_after = 0
+        if isinstance(exc, HTTPError):
+            try:
+                value = (exc.headers.get("Retry-After") or "") if exc.headers else ""
+                if value.strip().isdigit():
+                    retry_after = float(value)
+                elif value:
+                    retry_after = max(0, parsedate_to_datetime(value).timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                pass
+            finally:
+                exc.close()
+            if exc.code not in (408, 429, 500, 502, 503, 504):
+                raise DownloadError(message) from exc
+        if attempt == self.retries:
+            raise DownloadError(message) from exc
+        if not math.isfinite(retry_after):
+            retry_after = 0
+        base = min(2 ** min(attempt, 6), 48)
+        delay = min(base + random.uniform(0, base / 4), 60)
+        # The server's requested delay takes precedence over our backoff cap.
+        time.sleep(max(delay, retry_after))
 
     def get(self, url: str, limit: int, byte_range: tuple[int, int] | None = None) -> io.BytesIO:
         """Return a RAM buffer, retrying incomplete transfers from scratch."""
@@ -35,6 +77,7 @@ class Downloader:
                 if byte_range is not None:
                     headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
                 request = Request(url, headers=headers)
+                self._pace()
                 with urlopen(request, timeout=self.timeout) as response:
                     if byte_range is not None:
                         content_range = response.headers.get("Content-Range", "")
@@ -58,10 +101,7 @@ class Downloader:
             except (HTTPError, URLError, TimeoutError, ConnectionError,
                     http.client.HTTPException) as exc:
                 buffer.close()
-                retryable = not isinstance(exc, HTTPError) or exc.code in (408, 429, 500, 502, 503, 504)
-                if not retryable or attempt == self.retries:
-                    raise DownloadError(f"download failed: {url}: {exc}") from exc
-                time.sleep(min(2 ** attempt, 30))
+                self._retry(exc, attempt, f"download failed: {url}: {exc}")
             except BaseException:
                 buffer.close()
                 raise
@@ -70,6 +110,7 @@ class Downloader:
     def size(self, url: str) -> int:
         for attempt in range(self.retries + 1):
             try:
+                self._pace()
                 with urlopen(Request(url, method="HEAD", headers={
                         "User-Agent": "common-crawl-bloom/0.1", "Accept-Encoding": "identity"}),
                         timeout=self.timeout) as response:
@@ -79,10 +120,7 @@ class Downloader:
                     return size
             except (HTTPError, URLError, TimeoutError, ConnectionError,
                     http.client.HTTPException) as exc:
-                if (isinstance(exc, HTTPError) and exc.code not in (408, 429, 500, 502, 503, 504)
-                        or attempt == self.retries):
-                    raise DownloadError(f"could not get size: {url}: {exc}") from exc
-                time.sleep(min(2 ** attempt, 30))
+                self._retry(exc, attempt, f"could not get size: {url}: {exc}")
         raise AssertionError("unreachable")
 
 
